@@ -149,6 +149,63 @@ IMPORTANT location rules:
 
 YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
 
+YELP_CATEGORY_MAP = {
+    "employment": "employmentlaw",
+    "labor": "employmentlaw",
+    "wage": "employmentlaw",
+    "workplace": "employmentlaw",
+    "wrongful termination": "employmentlaw",
+    "discrimination": "employmentlaw",
+    "harassment": "employmentlaw",
+    "workers comp": "workerscomp",
+    "workers compensation": "workerscomp",
+    "immigration": "immigration",
+    "visa": "immigration",
+    "deportation": "immigration",
+    "asylum": "immigration",
+    "green card": "immigration",
+    "tenant": "realestatelaw",
+    "landlord": "realestatelaw",
+    "eviction": "realestatelaw",
+    "real estate": "realestatelaw",
+    "property": "realestatelaw",
+    "family": "familylaw",
+    "divorce": "familylaw",
+    "custody": "familylaw",
+    "child support": "familylaw",
+    "alimony": "familylaw",
+    "personal injury": "personalinjurylaw",
+    "accident": "personalinjurylaw",
+    "injury": "personalinjurylaw",
+    "malpractice": "personalinjurylaw",
+    "criminal": "criminaldefense",
+    "dui": "dwi",
+    "dwi": "dwi",
+    "bankruptcy": "bankruptcylaw",
+    "debt": "bankruptcylaw",
+    "business": "businesslaw",
+    "contract": "businesslaw",
+    "corporate": "businesslaw",
+    "tax": "taxlaw",
+    "estate planning": "estateplanning",
+    "will": "estateplanning",
+    "trust": "estateplanning",
+    "probate": "estateplanning",
+    "intellectual property": "iplaw",
+    "patent": "iplaw",
+    "trademark": "iplaw",
+    "copyright": "iplaw",
+}
+
+
+def _get_yelp_category(search_term, legal_category):
+    """Map search term and legal category to a specific Yelp law subcategory."""
+    text = f"{search_term} {legal_category}".lower()
+    for keyword, category in YELP_CATEGORY_MAP.items():
+        if keyword in text:
+            return category
+    return "lawyers"
+
 
 def _complete(messages, model_override=None, vision=False):
     """Call Groq first; on rate-limit or failure, fall back to SambaNova."""
@@ -341,17 +398,19 @@ def _extract_state_from_location(location):
     return ""
 
 
-def _search_yelp(search_term, location, limit=20):
+def _search_yelp(search_term, location, legal_category="", limit=20):
     """Search Yelp Fusion API for lawyers matching the query, filtered to the correct location."""
     if not YELP_API_KEY:
         return []
+
+    yelp_category = _get_yelp_category(search_term, legal_category)
 
     headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
     params = {
         "term": search_term,
         "location": location,
-        "categories": "lawyers",
-        "sort_by": "distance",
+        "categories": yelp_category,
+        "sort_by": "best_match",
         "limit": limit,
         "radius": 40000,
     }
@@ -431,12 +490,16 @@ def match_lawyers():
         search_term = ai_result.get("search_term", ai_result.get("attorney_type", "lawyer"))
         location = user_location or ai_result.get("location", ai_result.get("jurisdiction", "New York, NY"))
 
-        yelp_lawyers = _search_yelp(search_term, location)
+        legal_category = ai_result.get("legal_category", "")
+        yelp_lawyers = _search_yelp(search_term, location, legal_category)
+
+        if not yelp_lawyers:
+            yelp_lawyers = _search_yelp(search_term, location, "")
 
         if yelp_lawyers:
             return jsonify({
                 "lawyers": yelp_lawyers,
-                "legal_category": ai_result.get("legal_category", ""),
+                "legal_category": legal_category,
                 "jurisdiction": ai_result.get("jurisdiction", ""),
                 "search_location": location,
                 "source": "yelp",
