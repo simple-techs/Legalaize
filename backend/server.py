@@ -1,17 +1,29 @@
 import os
 import json
+import base64
 import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import google.generativeai as genai
+from openai import OpenAI
 
 app = Flask(__name__)
 CORS(app)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
+SAMBANOVA_MODEL = "Meta-Llama-3.1-70B-Instruct"
+
+groq_client = None
+sambanova_client = None
+
+if GROQ_API_KEY:
+    groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+
+if SAMBANOVA_API_KEY:
+    sambanova_client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
 
 SYSTEM_PROMPT = """You are Legalaize, an AI legal guidance assistant. You help users understand legal concepts, analyze documents, and provide general legal information.
 
@@ -134,8 +146,55 @@ Respond in this exact JSON format:
 Generate 5 realistic but fictional attorney profiles that match the user's needs:"""
 
 
-def get_model():
-    return genai.GenerativeModel("gemini-2.0-flash")
+def _complete(messages, model_override=None, vision=False):
+    """Call Groq first; on rate-limit or failure, fall back to SambaNova."""
+    last_error = None
+
+    if groq_client:
+        try:
+            model = model_override or (GROQ_VISION_MODEL if vision else GROQ_MODEL)
+            resp = groq_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=4096,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            if "429" not in error_str and "rate" not in error_str.lower():
+                raise
+
+    if sambanova_client:
+        try:
+            clean_messages = _strip_images(messages) if vision else messages
+            resp = sambanova_client.chat.completions.create(
+                model=SAMBANOVA_MODEL,
+                messages=clean_messages,
+                temperature=0.7,
+                max_tokens=4096,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("No AI provider configured. Set GROQ_API_KEY or SAMBANOVA_API_KEY.")
+
+
+def _strip_images(messages):
+    """Remove image content parts for providers that don't support vision."""
+    cleaned = []
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            text_parts = [p["text"] for p in msg["content"] if p.get("type") == "text"]
+            cleaned.append({**msg, "content": "\n".join(text_parts) + "\n[Image document was attached but cannot be processed by fallback model]"})
+        else:
+            cleaned.append(msg)
+    return cleaned
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -145,33 +204,28 @@ def chat():
         history_raw = request.form.get("history", "[]")
         history = json.loads(history_raw)
 
-        model = get_model()
-
-        gemini_history = []
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for msg in history[:-1]:
-            role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [msg["content"]]})
+            role = "user" if msg["role"] == "user" else "assistant"
+            messages.append({"role": role, "content": msg["content"]})
 
-        chat_session = model.start_chat(history=gemini_history)
-
-        full_prompt = f"{SYSTEM_PROMPT}\n\nUser message: {message}"
-
+        user_content = message
         files = request.files.getlist("files")
         if files:
-            file_descriptions = []
-            for f in files:
-                file_descriptions.append(f"[Attached file: {f.filename}]")
-            full_prompt += "\n\nAttached files: " + ", ".join(file_descriptions)
+            file_descriptions = [f"[Attached file: {f.filename}]" for f in files]
+            user_content += "\n\nAttached files: " + ", ".join(file_descriptions)
 
-        response = chat_session.send_message(full_prompt)
+        messages.append({"role": "user", "content": user_content})
+
+        response_text = _complete(messages)
 
         return jsonify({
-            "response": response.text,
+            "response": response_text,
             "legal_brief": None,
         })
     except Exception as e:
         traceback.print_exc()
-        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+        if "429" in str(e) or "rate" in str(e).lower():
             return jsonify({"error": "Rate limited. Please try again in a moment."}), 429
         return jsonify({"error": str(e)}), 500
 
@@ -187,14 +241,17 @@ def analyze():
         filename = file.filename.lower()
 
         if filename.endswith((".jpg", ".jpeg", ".png")):
-            import base64
             image_data = base64.b64encode(file.read()).decode("utf-8")
-            model = get_model()
-            response = model.generate_content([
-                ANALYZE_PROMPT.replace("{content}", "[Image document - see attached]"),
-                {"mime_type": file.content_type, "data": image_data},
-            ])
-            return jsonify({"analysis": response.text})
+            mime_type = file.content_type or "image/png"
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": ANALYZE_PROMPT.replace("{content}", "[Image document - see attached]")},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                ]},
+            ]
+            response_text = _complete(messages, vision=True)
+            return jsonify({"analysis": response_text})
 
         if filename.endswith(".pdf"):
             try:
@@ -214,10 +271,13 @@ def analyze():
         else:
             content = file.read().decode("utf-8", errors="ignore")
 
-        model = get_model()
-        response = model.generate_content(ANALYZE_PROMPT.format(content=content[:10000]))
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": ANALYZE_PROMPT.format(content=content[:10000])},
+        ]
+        response_text = _complete(messages)
 
-        return jsonify({"analysis": response.text})
+        return jsonify({"analysis": response_text})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -234,10 +294,13 @@ def generate_brief():
             for m in history
         )
 
-        model = get_model()
-        response = model.generate_content(BRIEF_PROMPT.format(conversation=conversation))
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": BRIEF_PROMPT.format(conversation=conversation)},
+        ]
+        response_text = _complete(messages)
 
-        return jsonify({"brief": response.text})
+        return jsonify({"brief": response_text})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -254,10 +317,12 @@ def match_lawyers():
             for m in history
         )
 
-        model = get_model()
-        response = model.generate_content(MATCH_PROMPT.format(conversation=conversation))
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": MATCH_PROMPT.format(conversation=conversation)},
+        ]
+        response_text = _complete(messages)
 
-        response_text = response.text
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0]
         elif "```" in response_text:
@@ -281,10 +346,13 @@ def generate_template():
 
         prompt = TEMPLATE_PROMPTS.get(template_id, f"Generate a professional {template_name} template with standard clauses. Include placeholder fields marked with [BRACKETS] for customization.")
 
-        model = get_model()
-        response = model.generate_content(prompt)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        response_text = _complete(messages)
 
-        return jsonify({"content": response.text})
+        return jsonify({"content": response_text})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -292,7 +360,16 @@ def generate_template():
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "legalaize"})
+    providers = []
+    if groq_client:
+        providers.append("groq")
+    if sambanova_client:
+        providers.append("sambanova")
+    return jsonify({
+        "status": "ok",
+        "service": "legalaize",
+        "providers": providers,
+    })
 
 
 if __name__ == "__main__":
