@@ -126,6 +126,8 @@ MATCH_PROMPT = """Based on the following conversation, identify:
 Conversation:
 {conversation}
 
+{location_hint}
+
 Respond in this exact JSON format only, no other text:
 {{
   "legal_category": "...",
@@ -135,8 +137,13 @@ Respond in this exact JSON format only, no other text:
   "location": "..."
 }}
 
-For search_term, provide a Yelp-friendly search query like "tenant rights attorney" or "employment lawyer".
-For location, provide the city and state like "Los Angeles, CA" or just the state like "California"."""
+IMPORTANT location rules:
+- search_term: a Yelp search query like "tenant rights attorney" or "employment lawyer"
+- location: MUST be a specific city and state like "Los Angeles, CA" or "Houston, TX". NEVER use just a state name.
+- If the user mentioned a specific city, use that city.
+- If the user only mentioned a state, pick the largest city in that state (e.g., California → Los Angeles, CA; Texas → Houston, TX; New York → New York, NY).
+- If no location is mentioned at all but a user_location hint is provided above, use that.
+- As a last resort, use "New York, NY"."""
 
 YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
 
@@ -353,15 +360,23 @@ def match_lawyers():
     try:
         data = request.get_json()
         history = data.get("history", [])
+        user_location = data.get("location", "")
 
         conversation = "\n".join(
             f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}"
             for m in history
         )
 
+        location_hint = ""
+        if user_location:
+            location_hint = f"User's current location: {user_location}. Prefer attorneys near this location."
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": MATCH_PROMPT.format(conversation=conversation)},
+            {"role": "user", "content": MATCH_PROMPT.format(
+                conversation=conversation,
+                location_hint=location_hint,
+            )},
         ]
         response_text = _complete(messages)
 
@@ -372,7 +387,7 @@ def match_lawyers():
 
         ai_result = json.loads(response_text.strip())
         search_term = ai_result.get("search_term", ai_result.get("attorney_type", "lawyer"))
-        location = ai_result.get("location", ai_result.get("jurisdiction", "United States"))
+        location = user_location or ai_result.get("location", ai_result.get("jurisdiction", "New York, NY"))
 
         yelp_lawyers = _search_yelp(search_term, location)
 
@@ -381,6 +396,7 @@ def match_lawyers():
                 "lawyers": yelp_lawyers,
                 "legal_category": ai_result.get("legal_category", ""),
                 "jurisdiction": ai_result.get("jurisdiction", ""),
+                "search_location": location,
                 "source": "yelp",
             })
 
@@ -388,6 +404,7 @@ def match_lawyers():
             "lawyers": [],
             "legal_category": ai_result.get("legal_category", ""),
             "jurisdiction": ai_result.get("jurisdiction", ""),
+            "search_location": location,
             "source": "none",
         })
     except json.JSONDecodeError:
