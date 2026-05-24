@@ -138,10 +138,15 @@ export function ChatProvider({ children }) {
       }));
 
       const response = await axios.post('/api/match', { history });
-      return response.data.lawyers;
+      return {
+        lawyers: response.data.lawyers || [],
+        legal_category: response.data.legal_category || '',
+        jurisdiction: response.data.jurisdiction || '',
+        source: response.data.source || '',
+      };
     } catch (error) {
       console.error('Failed to match lawyers:', error);
-      return [];
+      return { lawyers: [], source: 'error' };
     }
   }, [messages]);
 

@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import traceback
+import requests as http_requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
@@ -11,6 +12,7 @@ CORS(app)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
+YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
@@ -118,32 +120,25 @@ Provide your analysis:"""
 
 MATCH_PROMPT = """Based on the following conversation, identify:
 1. The legal category (e.g., Employment Law, Tenant Rights, Contract Law, Immigration, Family Law, etc.)
-2. The likely jurisdiction
+2. The likely jurisdiction (city and state)
 3. The type of attorney needed
 
 Conversation:
 {conversation}
 
-Respond in this exact JSON format:
+Respond in this exact JSON format only, no other text:
 {{
   "legal_category": "...",
   "jurisdiction": "...",
   "attorney_type": "...",
-  "lawyers": [
-    {{
-      "id": 1,
-      "name": "...",
-      "practice_area": "...",
-      "jurisdiction": "...",
-      "rating": 4.8,
-      "contact": "...@example.com",
-      "website": "https://example.com",
-      "description": "..."
-    }}
-  ]
+  "search_term": "...",
+  "location": "..."
 }}
 
-Generate 5 realistic but fictional attorney profiles that match the user's needs:"""
+For search_term, provide a Yelp-friendly search query like "tenant rights attorney" or "employment lawyer".
+For location, provide the city and state like "Los Angeles, CA" or just the state like "California"."""
+
+YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
 
 
 def _complete(messages, model_override=None, vision=False):
@@ -306,6 +301,53 @@ def generate_brief():
         return jsonify({"error": str(e)}), 500
 
 
+def _search_yelp(search_term, location, limit=10):
+    """Search Yelp Fusion API for lawyers matching the query."""
+    if not YELP_API_KEY:
+        return []
+
+    headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
+    params = {
+        "term": search_term,
+        "location": location,
+        "categories": "lawyers",
+        "sort_by": "best_match",
+        "limit": limit,
+    }
+
+    try:
+        resp = http_requests.get(YELP_API_URL, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        lawyers = []
+        for biz in data.get("businesses", []):
+            categories = [c["title"] for c in biz.get("categories", [])]
+            location_parts = biz.get("location", {})
+            city = location_parts.get("city", "")
+            state = location_parts.get("state", "")
+            jurisdiction = f"{city}, {state}" if city and state else city or state
+
+            lawyers.append({
+                "id": biz.get("id", ""),
+                "name": biz.get("name", ""),
+                "practice_area": ", ".join(categories),
+                "jurisdiction": jurisdiction,
+                "rating": biz.get("rating", 0),
+                "review_count": biz.get("review_count", 0),
+                "phone": biz.get("display_phone", ""),
+                "website": biz.get("url", ""),
+                "image_url": biz.get("image_url", ""),
+                "address": ", ".join(location_parts.get("display_address", [])),
+                "description": f"{biz.get('name', '')} — {', '.join(categories)} in {jurisdiction}. Rated {biz.get('rating', 'N/A')}/5 based on {biz.get('review_count', 0)} reviews.",
+                "source": "yelp",
+            })
+        return lawyers
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
 @app.route("/api/match", methods=["POST"])
 def match_lawyers():
     try:
@@ -328,10 +370,28 @@ def match_lawyers():
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0]
 
-        result = json.loads(response_text.strip())
-        return jsonify({"lawyers": result.get("lawyers", [])})
+        ai_result = json.loads(response_text.strip())
+        search_term = ai_result.get("search_term", ai_result.get("attorney_type", "lawyer"))
+        location = ai_result.get("location", ai_result.get("jurisdiction", "United States"))
+
+        yelp_lawyers = _search_yelp(search_term, location)
+
+        if yelp_lawyers:
+            return jsonify({
+                "lawyers": yelp_lawyers,
+                "legal_category": ai_result.get("legal_category", ""),
+                "jurisdiction": ai_result.get("jurisdiction", ""),
+                "source": "yelp",
+            })
+
+        return jsonify({
+            "lawyers": [],
+            "legal_category": ai_result.get("legal_category", ""),
+            "jurisdiction": ai_result.get("jurisdiction", ""),
+            "source": "none",
+        })
     except json.JSONDecodeError:
-        return jsonify({"lawyers": []})
+        return jsonify({"lawyers": [], "source": "none"})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -369,6 +429,7 @@ def health():
         "status": "ok",
         "service": "legalaize",
         "providers": providers,
+        "yelp": bool(YELP_API_KEY),
     })
 
 
