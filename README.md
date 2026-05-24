@@ -14,7 +14,8 @@ AI-powered legal guidance and attorney matching platform that makes legal unders
 ## Tech Stack
 
 - **Frontend**: React (CRA + CRACO), Tailwind CSS, Radix UI, Lucide Icons
-- **Backend**: Python Flask, Google Gemini API
+- **Backend**: Python Flask, Groq API (primary) + SambaNova API (fallback)
+- **AI Models**: Llama 3.3 70B (Groq), Llama 3.3 70B (SambaNova)
 - **Deployment**: Vercel (serverless)
 
 ## Getting Started
@@ -23,7 +24,8 @@ AI-powered legal guidance and attorney matching platform that makes legal unders
 
 - Node.js 18+
 - Python 3.9+
-- Google Gemini API key
+- Groq API key (free at https://console.groq.com/keys)
+- SambaNova API key (free fallback at https://cloud.sambanova.ai/apis)
 
 ### Frontend Setup
 
@@ -38,14 +40,17 @@ npm start
 ```bash
 cd backend
 pip install -r requirements.txt
-GEMINI_API_KEY=your_key python server.py
+GROQ_API_KEY=your_key SAMBANOVA_API_KEY=your_key python server.py
 ```
 
 ### Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `GEMINI_API_KEY` | Google Gemini API key |
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GROQ_API_KEY` | Groq API key (primary AI provider) | Yes |
+| `SAMBANOVA_API_KEY` | SambaNova API key (fallback provider) | Recommended |
+
+The backend uses Groq as the primary AI provider. When Groq rate limits are hit, it automatically falls back to SambaNova. Both offer free tiers.
 
 ## Project Structure
 
