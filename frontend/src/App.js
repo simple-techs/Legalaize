@@ -21,6 +21,16 @@ export default function App() {
             <Route path="/lawyers" element={<LawyersPage />} />
             <Route path="/templates" element={<TemplatesPage />} />
           </Routes>
+          <div className="px-4 py-3 text-center flex-shrink-0">
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              Always discuss Legalaize output with an attorney. Legalaize is an AI lawyer, not a licensed lawyer, does not practice law.
+              Legalaize is the first AI Lawyer working with human Lawyers licensed to practice law in your preferred area. By using
+              Legalaize, you agree to our{' '}
+              <button className="underline hover:text-gray-600">Terms of Service</button>
+              {' '}&{' '}
+              <button className="underline hover:text-gray-600">Privacy Policy</button>.
+            </p>
+          </div>
         </div>
       </Router>
     </ChatProvider>
