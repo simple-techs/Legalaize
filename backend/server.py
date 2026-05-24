@@ -14,7 +14,7 @@ SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
-SAMBANOVA_MODEL = "Meta-Llama-3.1-70B-Instruct"
+SAMBANOVA_MODEL = "Meta-Llama-3.3-70B-Instruct"
 
 groq_client = None
 sambanova_client = None

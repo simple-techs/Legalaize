@@ -15,7 +15,7 @@ AI-powered legal guidance and attorney matching platform that makes legal unders
 
 - **Frontend**: React (CRA + CRACO), Tailwind CSS, Radix UI, Lucide Icons
 - **Backend**: Python Flask, Groq API (primary) + SambaNova API (fallback)
-- **AI Models**: Llama 3.3 70B (Groq), Llama 3.1 70B (SambaNova)
+- **AI Models**: Llama 3.3 70B (Groq), Llama 3.3 70B (SambaNova)
 - **Deployment**: Vercel (serverless)
 
 ## Getting Started
