@@ -308,8 +308,39 @@ def generate_brief():
         return jsonify({"error": str(e)}), 500
 
 
-def _search_yelp(search_term, location, limit=10):
-    """Search Yelp Fusion API for lawyers matching the query."""
+US_STATE_ABBREVS = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+US_STATE_ABBREVS_REV = {v: v for v in US_STATE_ABBREVS.values()}
+
+
+def _extract_state_from_location(location):
+    """Extract the state abbreviation from a location string like 'Miami, FL' or 'Florida'."""
+    parts = [p.strip() for p in location.split(",")]
+    for part in reversed(parts):
+        upper = part.upper().strip()
+        if upper in US_STATE_ABBREVS_REV:
+            return upper
+        lower = part.lower().strip()
+        if lower in US_STATE_ABBREVS:
+            return US_STATE_ABBREVS[lower]
+    return ""
+
+
+def _search_yelp(search_term, location, limit=20):
+    """Search Yelp Fusion API for lawyers matching the query, filtered to the correct location."""
     if not YELP_API_KEY:
         return []
 
@@ -318,9 +349,12 @@ def _search_yelp(search_term, location, limit=10):
         "term": search_term,
         "location": location,
         "categories": "lawyers",
-        "sort_by": "best_match",
+        "sort_by": "distance",
         "limit": limit,
+        "radius": 40000,
     }
+
+    target_state = _extract_state_from_location(location)
 
     try:
         resp = http_requests.get(YELP_API_URL, headers=headers, params=params, timeout=10)
@@ -333,6 +367,10 @@ def _search_yelp(search_term, location, limit=10):
             location_parts = biz.get("location", {})
             city = location_parts.get("city", "")
             state = location_parts.get("state", "")
+
+            if target_state and state.upper() != target_state.upper():
+                continue
+
             jurisdiction = f"{city}, {state}" if city and state else city or state
 
             lawyers.append({
@@ -349,7 +387,9 @@ def _search_yelp(search_term, location, limit=10):
                 "description": f"{biz.get('name', '')} — {', '.join(categories)} in {jurisdiction}. Rated {biz.get('rating', 'N/A')}/5 based on {biz.get('review_count', 0)} reviews.",
                 "source": "yelp",
             })
-        return lawyers
+
+        lawyers.sort(key=lambda x: x.get("rating", 0), reverse=True)
+        return lawyers[:10]
     except Exception:
         traceback.print_exc()
         return []
