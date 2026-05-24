@@ -126,6 +126,8 @@ MATCH_PROMPT = """Based on the following conversation, identify:
 Conversation:
 {conversation}
 
+{location_hint}
+
 Respond in this exact JSON format only, no other text:
 {{
   "legal_category": "...",
@@ -135,8 +137,13 @@ Respond in this exact JSON format only, no other text:
   "location": "..."
 }}
 
-For search_term, provide a Yelp-friendly search query like "tenant rights attorney" or "employment lawyer".
-For location, provide the city and state like "Los Angeles, CA" or just the state like "California"."""
+IMPORTANT location rules:
+- search_term: a Yelp search query like "tenant rights attorney" or "employment lawyer"
+- location: MUST be a specific city and state like "Los Angeles, CA" or "Houston, TX". NEVER use just a state name.
+- If the user mentioned a specific city, use that city.
+- If the user only mentioned a state, pick the largest city in that state (e.g., California → Los Angeles, CA; Texas → Houston, TX; New York → New York, NY).
+- If no location is mentioned at all but a user_location hint is provided above, use that.
+- As a last resort, use "New York, NY"."""
 
 YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
 
@@ -301,8 +308,39 @@ def generate_brief():
         return jsonify({"error": str(e)}), 500
 
 
-def _search_yelp(search_term, location, limit=10):
-    """Search Yelp Fusion API for lawyers matching the query."""
+US_STATE_ABBREVS = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+US_STATE_ABBREVS_REV = {v: v for v in US_STATE_ABBREVS.values()}
+
+
+def _extract_state_from_location(location):
+    """Extract the state abbreviation from a location string like 'Miami, FL' or 'Florida'."""
+    parts = [p.strip() for p in location.split(",")]
+    for part in reversed(parts):
+        upper = part.upper().strip()
+        if upper in US_STATE_ABBREVS_REV:
+            return upper
+        lower = part.lower().strip()
+        if lower in US_STATE_ABBREVS:
+            return US_STATE_ABBREVS[lower]
+    return ""
+
+
+def _search_yelp(search_term, location, limit=20):
+    """Search Yelp Fusion API for lawyers matching the query, filtered to the correct location."""
     if not YELP_API_KEY:
         return []
 
@@ -311,9 +349,12 @@ def _search_yelp(search_term, location, limit=10):
         "term": search_term,
         "location": location,
         "categories": "lawyers",
-        "sort_by": "best_match",
+        "sort_by": "distance",
         "limit": limit,
+        "radius": 40000,
     }
+
+    target_state = _extract_state_from_location(location)
 
     try:
         resp = http_requests.get(YELP_API_URL, headers=headers, params=params, timeout=10)
@@ -326,6 +367,10 @@ def _search_yelp(search_term, location, limit=10):
             location_parts = biz.get("location", {})
             city = location_parts.get("city", "")
             state = location_parts.get("state", "")
+
+            if target_state and state.upper() != target_state.upper():
+                continue
+
             jurisdiction = f"{city}, {state}" if city and state else city or state
 
             lawyers.append({
@@ -342,7 +387,9 @@ def _search_yelp(search_term, location, limit=10):
                 "description": f"{biz.get('name', '')} — {', '.join(categories)} in {jurisdiction}. Rated {biz.get('rating', 'N/A')}/5 based on {biz.get('review_count', 0)} reviews.",
                 "source": "yelp",
             })
-        return lawyers
+
+        lawyers.sort(key=lambda x: x.get("rating", 0), reverse=True)
+        return lawyers[:10]
     except Exception:
         traceback.print_exc()
         return []
@@ -353,15 +400,23 @@ def match_lawyers():
     try:
         data = request.get_json()
         history = data.get("history", [])
+        user_location = data.get("location", "")
 
         conversation = "\n".join(
             f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}"
             for m in history
         )
 
+        location_hint = ""
+        if user_location:
+            location_hint = f"User's current location: {user_location}. Prefer attorneys near this location."
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": MATCH_PROMPT.format(conversation=conversation)},
+            {"role": "user", "content": MATCH_PROMPT.format(
+                conversation=conversation,
+                location_hint=location_hint,
+            )},
         ]
         response_text = _complete(messages)
 
@@ -372,7 +427,7 @@ def match_lawyers():
 
         ai_result = json.loads(response_text.strip())
         search_term = ai_result.get("search_term", ai_result.get("attorney_type", "lawyer"))
-        location = ai_result.get("location", ai_result.get("jurisdiction", "United States"))
+        location = user_location or ai_result.get("location", ai_result.get("jurisdiction", "New York, NY"))
 
         yelp_lawyers = _search_yelp(search_term, location)
 
@@ -381,6 +436,7 @@ def match_lawyers():
                 "lawyers": yelp_lawyers,
                 "legal_category": ai_result.get("legal_category", ""),
                 "jurisdiction": ai_result.get("jurisdiction", ""),
+                "search_location": location,
                 "source": "yelp",
             })
 
@@ -388,6 +444,7 @@ def match_lawyers():
             "lawyers": [],
             "legal_category": ai_result.get("legal_category", ""),
             "jurisdiction": ai_result.get("jurisdiction", ""),
+            "search_location": location,
             "source": "none",
         })
     except json.JSONDecodeError:
