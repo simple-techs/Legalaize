@@ -130,18 +130,29 @@ export function ChatProvider({ children }) {
     }
   }, [messages]);
 
-  const matchLawyers = useCallback(async () => {
+  const matchLawyers = useCallback(async (userLocation = '') => {
     try {
       const history = messages.map(m => ({
         role: m.role,
         content: m.content,
       }));
 
-      const response = await axios.post('/api/match', { history });
-      return response.data.lawyers;
+      const payload = { history };
+      if (userLocation) {
+        payload.location = userLocation;
+      }
+
+      const response = await axios.post('/api/match', payload);
+      return {
+        lawyers: response.data.lawyers || [],
+        legal_category: response.data.legal_category || '',
+        jurisdiction: response.data.jurisdiction || '',
+        search_location: response.data.search_location || '',
+        source: response.data.source || '',
+      };
     } catch (error) {
       console.error('Failed to match lawyers:', error);
-      return [];
+      return { lawyers: [], source: 'error' };
     }
   }, [messages]);
 

@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import traceback
+import requests as http_requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
@@ -11,6 +12,7 @@ CORS(app)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
+YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
@@ -25,19 +27,21 @@ if GROQ_API_KEY:
 if SAMBANOVA_API_KEY:
     sambanova_client = OpenAI(api_key=SAMBANOVA_API_KEY, base_url="https://api.sambanova.ai/v1")
 
-SYSTEM_PROMPT = """You are Legalaize, an AI legal guidance assistant. You help users understand legal concepts, analyze documents, and provide general legal information.
+SYSTEM_PROMPT = """You are Legalaize, an AI attorney platform. You give users real legal guidance as though you are their attorney advising them on their case.
 
-IMPORTANT RULES:
-1. You are NOT a licensed attorney and do not provide legal advice. You provide legal GUIDANCE and INFORMATION.
-2. Always recommend consulting with a licensed attorney for specific legal matters.
-3. Be clear, concise, and use plain language to explain legal concepts.
-4. When analyzing documents, identify key clauses, risks, and missing protections.
-5. When generating legal briefs, include: Case Summary, Timeline, Key Legal Issues, Jurisdiction, Important Facts, and Suggested Next Steps.
-6. Detect the user's language and respond in the same language.
-7. Ask clarifying questions when needed to better understand the user's situation.
-8. Identify the relevant jurisdiction and legal category when possible.
-9. Provide risk analysis when appropriate.
-10. Never make definitive legal conclusions - use phrases like "generally," "typically," "in most jurisdictions."
+MANDATORY FIRST STEP: When a user describes their legal issue, your FIRST response must ask for their location (state/city or country) before providing any legal guidance. Say something like: "To give you accurate legal guidance based on the laws in your area, I need to know — what state and city are you in?" Do NOT give substantive legal advice until you know their location. You may acknowledge their situation briefly, but do not list options or cite laws until location is confirmed.
+
+AFTER LOCATION IS PROVIDED — RESPOND LIKE THEIR ATTORNEY:
+1. Give them the exact laws that apply to their situation. Cite statute numbers, code sections, and local ordinances by name. Example: "Under California Labor Code § 1194, your employer is required to pay you the difference between what you were paid and the minimum wage."
+2. Tell them exactly what to do. Not "consider consulting an attorney" — instead: "File a wage claim with the California Division of Labor Standards Enforcement (DLSE). Here is how to do it step by step."
+3. Give them their legal rights plainly. Example: "Your immigration status does not affect your right to recover unpaid wages. The FLSA protects all workers regardless of immigration status."
+4. Do NOT soften, hedge, or qualify your guidance. No "generally", "typically", "in most cases", "you may want to consider", "it's completely understandable." Give the answer directly.
+5. Do NOT add disclaimers like "I'm not a lawyer", "consult an attorney", "this is not legal advice", or "I cannot provide legal advice." The platform UI handles disclaimers.
+6. Do NOT express sympathy or emotional support. Skip phrases like "I'm so sorry to hear that" or "It's completely understandable." Get straight to the legal guidance.
+7. When analyzing documents, name the exact clauses that are problematic, explain why they hurt the user, and provide the exact replacement language they should request.
+8. Detect the user's language and respond in the same language.
+9. Give deadlines and timelines: statute of limitations, filing deadlines, notice periods, response windows.
+10. End every response with a "What to do right now" section — numbered steps with specific agencies, phone numbers, forms, and websites.
 
 You can help with:
 - Tenant disputes, employment issues, contract confusion, immigration questions
@@ -118,32 +122,32 @@ Provide your analysis:"""
 
 MATCH_PROMPT = """Based on the following conversation, identify:
 1. The legal category (e.g., Employment Law, Tenant Rights, Contract Law, Immigration, Family Law, etc.)
-2. The likely jurisdiction
+2. The likely jurisdiction (city and state)
 3. The type of attorney needed
 
 Conversation:
 {conversation}
 
-Respond in this exact JSON format:
+{location_hint}
+
+Respond in this exact JSON format only, no other text:
 {{
   "legal_category": "...",
   "jurisdiction": "...",
   "attorney_type": "...",
-  "lawyers": [
-    {{
-      "id": 1,
-      "name": "...",
-      "practice_area": "...",
-      "jurisdiction": "...",
-      "rating": 4.8,
-      "contact": "...@example.com",
-      "website": "https://example.com",
-      "description": "..."
-    }}
-  ]
+  "search_term": "...",
+  "location": "..."
 }}
 
-Generate 5 realistic but fictional attorney profiles that match the user's needs:"""
+IMPORTANT location rules:
+- search_term: a Yelp search query like "tenant rights attorney" or "employment lawyer"
+- location: MUST be a specific city and state like "Los Angeles, CA" or "Houston, TX". NEVER use just a state name.
+- If the user mentioned a specific city, use that city.
+- If the user only mentioned a state, pick the largest city in that state (e.g., California → Los Angeles, CA; Texas → Houston, TX; New York → New York, NY).
+- If no location is mentioned at all but a user_location hint is provided above, use that.
+- As a last resort, use "New York, NY"."""
+
+YELP_API_URL = "https://api.yelp.com/v3/businesses/search"
 
 
 def _complete(messages, model_override=None, vision=False):
@@ -306,20 +310,115 @@ def generate_brief():
         return jsonify({"error": str(e)}), 500
 
 
+US_STATE_ABBREVS = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+US_STATE_ABBREVS_REV = {v: v for v in US_STATE_ABBREVS.values()}
+
+
+def _extract_state_from_location(location):
+    """Extract the state abbreviation from a location string like 'Miami, FL' or 'Florida'."""
+    parts = [p.strip() for p in location.split(",")]
+    for part in reversed(parts):
+        upper = part.upper().strip()
+        if upper in US_STATE_ABBREVS_REV:
+            return upper
+        lower = part.lower().strip()
+        if lower in US_STATE_ABBREVS:
+            return US_STATE_ABBREVS[lower]
+    return ""
+
+
+def _search_yelp(search_term, location, limit=20):
+    """Search Yelp Fusion API for lawyers matching the query, filtered to the correct location."""
+    if not YELP_API_KEY:
+        return []
+
+    headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
+    params = {
+        "term": search_term,
+        "location": location,
+        "categories": "lawyers",
+        "sort_by": "distance",
+        "limit": limit,
+        "radius": 40000,
+    }
+
+    target_state = _extract_state_from_location(location)
+
+    try:
+        resp = http_requests.get(YELP_API_URL, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        lawyers = []
+        for biz in data.get("businesses", []):
+            categories = [c["title"] for c in biz.get("categories", [])]
+            location_parts = biz.get("location", {})
+            city = location_parts.get("city", "")
+            state = location_parts.get("state", "")
+
+            if target_state and state.upper() != target_state.upper():
+                continue
+
+            jurisdiction = f"{city}, {state}" if city and state else city or state
+
+            lawyers.append({
+                "id": biz.get("id", ""),
+                "name": biz.get("name", ""),
+                "practice_area": ", ".join(categories),
+                "jurisdiction": jurisdiction,
+                "rating": biz.get("rating", 0),
+                "review_count": biz.get("review_count", 0),
+                "phone": biz.get("display_phone", ""),
+                "website": biz.get("url", ""),
+                "image_url": biz.get("image_url", ""),
+                "address": ", ".join(location_parts.get("display_address", [])),
+                "description": f"{biz.get('name', '')} — {', '.join(categories)} in {jurisdiction}. Rated {biz.get('rating', 'N/A')}/5 based on {biz.get('review_count', 0)} reviews.",
+                "source": "yelp",
+            })
+
+        lawyers.sort(key=lambda x: x.get("rating", 0), reverse=True)
+        return lawyers[:10]
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
 @app.route("/api/match", methods=["POST"])
 def match_lawyers():
     try:
         data = request.get_json()
         history = data.get("history", [])
+        user_location = data.get("location", "")
 
         conversation = "\n".join(
             f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}"
             for m in history
         )
 
+        location_hint = ""
+        if user_location:
+            location_hint = f"User's current location: {user_location}. Prefer attorneys near this location."
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": MATCH_PROMPT.format(conversation=conversation)},
+            {"role": "user", "content": MATCH_PROMPT.format(
+                conversation=conversation,
+                location_hint=location_hint,
+            )},
         ]
         response_text = _complete(messages)
 
@@ -328,10 +427,30 @@ def match_lawyers():
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0]
 
-        result = json.loads(response_text.strip())
-        return jsonify({"lawyers": result.get("lawyers", [])})
+        ai_result = json.loads(response_text.strip())
+        search_term = ai_result.get("search_term", ai_result.get("attorney_type", "lawyer"))
+        location = user_location or ai_result.get("location", ai_result.get("jurisdiction", "New York, NY"))
+
+        yelp_lawyers = _search_yelp(search_term, location)
+
+        if yelp_lawyers:
+            return jsonify({
+                "lawyers": yelp_lawyers,
+                "legal_category": ai_result.get("legal_category", ""),
+                "jurisdiction": ai_result.get("jurisdiction", ""),
+                "search_location": location,
+                "source": "yelp",
+            })
+
+        return jsonify({
+            "lawyers": [],
+            "legal_category": ai_result.get("legal_category", ""),
+            "jurisdiction": ai_result.get("jurisdiction", ""),
+            "search_location": location,
+            "source": "none",
+        })
     except json.JSONDecodeError:
-        return jsonify({"lawyers": []})
+        return jsonify({"lawyers": [], "source": "none"})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -369,6 +488,7 @@ def health():
         "status": "ok",
         "service": "legalaize",
         "providers": providers,
+        "yelp": bool(YELP_API_KEY),
     })
 
 
