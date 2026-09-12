@@ -14,9 +14,9 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
 YELP_API_KEY = os.environ.get("YELP_API_KEY", "")
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
-SAMBANOVA_MODEL = "Meta-Llama-3.3-70B-Instruct"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+SAMBANOVA_MODEL = os.environ.get("SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct")
 
 groq_client = None
 sambanova_client = None
@@ -208,7 +208,7 @@ def _get_yelp_category(search_term, legal_category):
 
 
 def _complete(messages, model_override=None, vision=False):
-    """Call Groq first; on rate-limit or failure, fall back to SambaNova."""
+    """Call Groq first; on any failure (rate limit, retired model, outage), fall back to SambaNova."""
     last_error = None
 
     if groq_client:
@@ -220,26 +220,23 @@ def _complete(messages, model_override=None, vision=False):
                 temperature=0.7,
                 max_tokens=4096,
             )
-            return resp.choices[0].message.content
+            content = resp.choices[0].message.content
+            if content:
+                return content
+            last_error = RuntimeError(f"Groq returned an empty response from {model}")
         except Exception as e:
             last_error = e
-            error_str = str(e)
-            if "429" not in error_str and "rate" not in error_str.lower():
-                raise
+            traceback.print_exc()
 
     if sambanova_client:
-        try:
-            clean_messages = _strip_images(messages) if vision else messages
-            resp = sambanova_client.chat.completions.create(
-                model=SAMBANOVA_MODEL,
-                messages=clean_messages,
-                temperature=0.7,
-                max_tokens=4096,
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            last_error = e
-            raise
+        clean_messages = _strip_images(messages) if vision else messages
+        resp = sambanova_client.chat.completions.create(
+            model=SAMBANOVA_MODEL,
+            messages=clean_messages,
+            temperature=0.7,
+            max_tokens=4096,
+        )
+        return resp.choices[0].message.content
 
     if last_error:
         raise last_error
@@ -258,6 +255,32 @@ def _strip_images(messages):
     return cleaned
 
 
+def _extract_text(file):
+    """Extract plain text from an uploaded PDF, DOCX, or text file. Returns '' for images."""
+    filename = (file.filename or "").lower()
+
+    if filename.endswith((".jpg", ".jpeg", ".png")):
+        return ""
+
+    if filename.endswith(".pdf"):
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(file)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except ImportError:
+            return "[PDF file uploaded - PyPDF2 not available for text extraction]"
+
+    if filename.endswith((".docx", ".doc")):
+        try:
+            import docx
+            doc = docx.Document(file)
+            return "\n".join(p.text for p in doc.paragraphs)
+        except ImportError:
+            return "[DOCX file uploaded - python-docx not available for text extraction]"
+
+    return file.read().decode("utf-8", errors="ignore")
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     try:
@@ -271,10 +294,12 @@ def chat():
             messages.append({"role": role, "content": msg["content"]})
 
         user_content = message
-        files = request.files.getlist("files")
-        if files:
-            file_descriptions = [f"[Attached file: {f.filename}]" for f in files]
-            user_content += "\n\nAttached files: " + ", ".join(file_descriptions)
+        for f in request.files.getlist("files"):
+            text = _extract_text(f).strip()
+            if text:
+                user_content += f"\n\n--- Attached file: {f.filename} ---\n{text[:10000]}"
+            else:
+                user_content += f"\n\n[Attached file: {f.filename} (contents could not be read as text)]"
 
         messages.append({"role": "user", "content": user_content})
 
@@ -298,8 +323,7 @@ def analyze():
         if not file:
             return jsonify({"error": "No file provided"}), 400
 
-        content = ""
-        filename = file.filename.lower()
+        filename = (file.filename or "").lower()
 
         if filename.endswith((".jpg", ".jpeg", ".png")):
             image_data = base64.b64encode(file.read()).decode("utf-8")
@@ -314,23 +338,9 @@ def analyze():
             response_text = _complete(messages, vision=True)
             return jsonify({"analysis": response_text})
 
-        if filename.endswith(".pdf"):
-            try:
-                import PyPDF2
-                reader = PyPDF2.PdfReader(file)
-                content = "\n".join(page.extract_text() or "" for page in reader.pages)
-            except ImportError:
-                content = "[PDF file uploaded - PyPDF2 not available for text extraction]"
-
-        elif filename.endswith((".docx", ".doc")):
-            try:
-                import docx
-                doc = docx.Document(file)
-                content = "\n".join(p.text for p in doc.paragraphs)
-            except ImportError:
-                content = "[DOCX file uploaded - python-docx not available for text extraction]"
-        else:
-            content = file.read().decode("utf-8", errors="ignore")
+        content = _extract_text(file)
+        if not content.strip():
+            return jsonify({"error": "No readable text found in the document"}), 400
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -347,8 +357,10 @@ def analyze():
 @app.route("/api/brief", methods=["POST"])
 def generate_brief():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         history = data.get("history", [])
+        if not any(m.get("role") == "user" for m in history):
+            return jsonify({"error": "Start a chat about your legal issue before generating a brief"}), 400
 
         conversation = "\n".join(
             f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}"
@@ -459,7 +471,7 @@ def _search_yelp(search_term, location, legal_category="", limit=20):
 @app.route("/api/match", methods=["POST"])
 def match_lawyers():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         history = data.get("history", [])
         user_location = data.get("location", "")
 
@@ -522,7 +534,7 @@ def match_lawyers():
 @app.route("/api/template", methods=["POST"])
 def generate_template():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         template_id = data.get("template_id", "")
         template_name = data.get("template_name", "")
 
