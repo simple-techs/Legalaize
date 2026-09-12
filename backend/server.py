@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import traceback
@@ -49,6 +50,11 @@ You can help with:
 - Document analysis (leases, contracts, NDAs, etc.)
 - Legal brief generation
 - Attorney matching recommendations"""
+
+TASK_SYSTEM_PROMPT = """You are Legalaize, an AI attorney platform. Complete the requested legal drafting or analysis task directly and fully.
+Do NOT ask the user questions, do NOT ask for their location, and do NOT add disclaimers such as "consult an attorney" or "this is not legal advice".
+When analyzing documents, name the exact clauses that are problematic, explain why they hurt the user, and provide the exact replacement language to request.
+Cite specific statutes and code sections when a jurisdiction is known. Detect the user's language and respond in the same language. Use Markdown formatting."""
 
 BRIEF_PROMPT = """Based on the following conversation, generate a comprehensive legal brief with the following sections:
 
@@ -220,7 +226,7 @@ def _complete(messages, model_override=None, vision=False):
                 temperature=0.7,
                 max_tokens=4096,
             )
-            content = resp.choices[0].message.content
+            content = _strip_thinking(resp.choices[0].message.content)
             if content:
                 return content
             last_error = RuntimeError(f"Groq returned an empty response from {model}")
@@ -236,11 +242,24 @@ def _complete(messages, model_override=None, vision=False):
             temperature=0.7,
             max_tokens=4096,
         )
-        return resp.choices[0].message.content
+        return _strip_thinking(resp.choices[0].message.content)
 
     if last_error:
         raise last_error
     raise RuntimeError("No AI provider configured. Set GROQ_API_KEY or SAMBANOVA_API_KEY.")
+
+
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text):
+    """Remove reasoning-model <think>...</think> blocks from a completion."""
+    if not text:
+        return text
+    cleaned = THINK_BLOCK_RE.sub("", text)
+    if "<think>" in cleaned.lower() and "</think>" not in cleaned.lower():
+        cleaned = re.split(r"<think>", cleaned, flags=re.IGNORECASE)[0]
+    return cleaned.strip()
 
 
 def _strip_images(messages):
@@ -329,7 +348,7 @@ def analyze():
             image_data = base64.b64encode(file.read()).decode("utf-8")
             mime_type = file.content_type or "image/png"
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": TASK_SYSTEM_PROMPT},
                 {"role": "user", "content": [
                     {"type": "text", "text": ANALYZE_PROMPT.replace("{content}", "[Image document - see attached]")},
                     {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
@@ -343,7 +362,7 @@ def analyze():
             return jsonify({"error": "No readable text found in the document"}), 400
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": TASK_SYSTEM_PROMPT},
             {"role": "user", "content": ANALYZE_PROMPT.format(content=content[:10000])},
         ]
         response_text = _complete(messages)
@@ -368,7 +387,7 @@ def generate_brief():
         )
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": TASK_SYSTEM_PROMPT},
             {"role": "user", "content": BRIEF_PROMPT.format(conversation=conversation)},
         ]
         response_text = _complete(messages)
@@ -485,7 +504,7 @@ def match_lawyers():
             location_hint = f"User's current location: {user_location}. Prefer attorneys near this location."
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": TASK_SYSTEM_PROMPT},
             {"role": "user", "content": MATCH_PROMPT.format(
                 conversation=conversation,
                 location_hint=location_hint,
@@ -541,7 +560,7 @@ def generate_template():
         prompt = TEMPLATE_PROMPTS.get(template_id, f"Generate a professional {template_name} template with standard clauses. Include placeholder fields marked with [BRACKETS] for customization.")
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": TASK_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
         response_text = _complete(messages)
